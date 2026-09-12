@@ -136,7 +136,7 @@ def test_freebuff_is_not_a_routed_provider():
     """No /v1 provider, no chain hop, no ad-stripping: only install/open/status."""
     import re
     routes = set(re.findall(r'@app\.route\("(/api/freebuff/[^"]+)"', APP))
-    assert routes == {"/api/freebuff/status", "/api/freebuff/install", "/api/freebuff/open"}
+    assert routes == {"/api/freebuff/status", "/api/freebuff/models", "/api/freebuff/install", "/api/freebuff/open"}
     # It is not registered as a provider anywhere.
     assert '"freebuff"' not in APP[APP.index("PROVIDERS = "):APP.index("PROVIDERS = ") + 200] \
         if "PROVIDERS = " in APP else True
@@ -190,6 +190,100 @@ def test_the_card_says_it_is_not_a_routed_provider():
 def test_the_card_points_to_the_models_already_routable():
     i = SRC.index('id="freebuff-card"')
     around = SRC[i:i + 1600]
-    assert "already routable in the hub" in around
-    for m in ("GLM 5.3 Flash", "DeepSeek V4 Flash", "MiMo 2.5"):
-        assert m in around
+    assert "Its free models, live in the hub" in around
+    assert 'id="fb-models"' in around
+
+
+# --------------------------------------------------------------------------- #
+# Dynamic detection of the free models already in the hub
+# --------------------------------------------------------------------------- #
+
+def _fake_tracking(monkeypatch, models):
+    class _R:
+        def get_json(self):
+            return {"models": models}
+    monkeypatch.setattr(A, "api_tracking", lambda: _R())
+    # No network in the test: pin the free families to a known set.
+    monkeypatch.setattr(A, "_freebuff_families", lambda: [
+        ("glm-5-3-flash", "GLM 5 3 Flash"), ("deepseek-flash", "Deepseek Flash"),
+        ("mimo", "Mimo"), ("minimax-m3", "Minimax M3"), ("luna", "Luna")])
+
+
+def test_it_detects_the_free_models_live(monkeypatch):
+    _fake_tracking(monkeypatch, [
+        {"model": "z-ai/glm-5.3-flash", "provider": "nvidia", "state": "ok", "score": 9, "id": "nvidia/z-ai/glm-5.3-flash"},
+        {"model": "deepseek-ai/DeepSeek-V4.1-Flash", "provider": "dahl", "state": "ok", "score": 8, "id": "dahl/deepseek-ai/DeepSeek-V4.1-Flash"},
+        {"model": "mimo-v2.5-pro", "provider": "g4f", "state": "dead", "score": 1, "id": "g4f/mimo-v2.5-pro"},
+    ])
+    d = A.app.test_client().get("/api/freebuff/models", headers=_hdr()).get_json()
+    by = {m["name"]: m for m in d["models"]}
+    assert by["GLM 5 3 Flash"]["available"] is True and "nvidia" in by["GLM 5 3 Flash"]["providers"]
+    assert by["Deepseek Flash"]["available"] is True, "V4.1 Flash counts as DeepSeek flash"
+    assert by["Deepseek Flash"]["pick"] == "dahl/deepseek-ai/DeepSeek-V4.1-Flash"
+    assert by["Mimo"]["available"] is False, "a dead hit is not available"
+    assert d["available"] >= 2
+
+
+def test_the_newest_deepseek_v4_1_flash_is_recognised(monkeypatch):
+    _fake_tracking(monkeypatch, [
+        {"model": "deepseek-v4.1-flash", "provider": "x", "state": "ok", "score": 5, "id": "x/deepseek-v4.1-flash"},
+    ])
+    d = A.app.test_client().get("/api/freebuff/models", headers=_hdr()).get_json()
+    assert next(m for m in d["models"] if m["name"] == "Deepseek Flash")["available"] is True
+
+
+def test_the_detector_never_500s(monkeypatch):
+    def boom():
+        raise RuntimeError("no tracking")
+    monkeypatch.setattr(A, "api_tracking", boom)
+    r = A.app.test_client().get("/api/freebuff/models", headers=_hdr())
+    assert r.status_code == 200 and r.get_json()["available"] == 0
+
+
+def test_the_card_renders_the_live_models():
+    body = SRC[SRC.index("function initFreebuffCard()"):]
+    body = body[:body.index("function loadProviders()")]
+    assert "/api/freebuff/models" in body
+    assert 'id="fb-models"' in SRC
+    assert "loadModels();" in body
+
+
+# --------------------------------------------------------------------------- #
+# The list is read from Codebuff's repo, not hardcoded
+# --------------------------------------------------------------------------- #
+
+FA_SAMPLE = """
+  export const FREE_AGENTS = {
+    'base2-free-deepseek-flash': X, 'base2-free-deepseek-flash-max': X,
+    'base3-free-glm-5-3-flash': X, 'base2-free-mimo': X, 'base2-free-mimo-pro': X,
+    'base2-free-luna': X, 'base2-free-luna-es': X, 'base2-free-solar-pro4': X,
+    'base2-free-kimi-k3-eco': X, 'base3-free-newmodel-2': X,
+  }
+"""
+
+
+def test_families_are_parsed_from_the_repo_text():
+    fams = dict(A._freebuff_parse_families(FA_SAMPLE))
+    slugs = set(fams)
+    assert "deepseek-flash" in slugs
+    assert "deepseek-flash-max" not in slugs, "tier suffixes are collapsed"
+    assert "glm-5-3-flash" in slugs and "mimo" in slugs and "luna" in slugs
+    assert "kimi-k3-eco" in slugs, "a family the old hardcoded list never had"
+    assert "newmodel" in slugs, "a brand-new free family shows up with no code change"
+
+
+def test_patterns_cover_the_dot_and_synonym_forms():
+    assert "glm-5.3-flash" in A._freebuff_patterns("glm-5-3-flash")
+    assert "luna" in A._freebuff_patterns("luna") and "gpt-5.6" in A._freebuff_patterns("luna")
+    assert "solar" in A._freebuff_patterns("solar-pro4")
+
+
+def test_it_falls_back_to_a_seed_offline(monkeypatch):
+    """A failed fetch must not blank the card."""
+    class _Boom:
+        def __init__(self, *a, **k): raise RuntimeError("offline")
+    monkeypatch.setattr(A.requests, "get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+    with A._freebuff_models_lock:
+        A._freebuff_models_cache.update({"at": 0.0, "families": None})
+    fams = A._freebuff_families()
+    assert fams and len(fams) >= 5, "the seed keeps the card populated when offline"

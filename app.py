@@ -11427,6 +11427,140 @@ def api_freebuff_status():
     })
 
 
+# Freebuff's free line-up, read from ITS OWN source of truth -- not hardcoded.
+#
+# Asked for: "detect the free models dynamically, no hardcoding." Codebuff
+# publishes which agent+model combos are free in
+# common/src/constants/free-agents.ts as `base2-free-<family>` /
+# `base3-free-<family>` agent ids. The hub fetches that file (cached), pulls
+# the family slugs, and matches them against its OWN live catalog. So the list
+# tracks whatever Codebuff currently offers, and a new free family they add
+# shows up here with no code change. Everything read is public; nothing about
+# Freebuff's own gate is touched (see the note above api_freebuff_status).
+_FREEBUFF_AGENTS_URL = ("https://raw.githubusercontent.com/CodebuffAI/codebuff/"
+                        "main/common/src/constants/free-agents.ts")
+_FREEBUFF_MODELS_TTL = 12 * 3600
+_freebuff_models_cache = {"at": 0.0, "families": None}
+_freebuff_models_lock = threading.Lock()
+
+# A tiny seed used ONLY when the fetch fails (offline / rate-limited), so the
+# card is never blank. Not the source of truth -- the repo is.
+_FREEBUFF_SEED_FAMILIES = [
+    ("deepseek-flash", "DeepSeek V4 Flash"), ("deepseek", "DeepSeek V4"),
+    ("glm-5-3-flash", "GLM 5.3 Flash"), ("mimo", "MiMo 2.5"),
+    ("minimax-m3", "MiniMax M3"), ("luna", "GPT-5.6 Luna"),
+    ("solar-pro4", "Solar Pro 4"), ("muse-spark", "Muse Spark"),
+    ("fable", "Claude Fable 5"),
+]
+# Family slug -> the words to look for in a hub model id. A family like "luna"
+# is served here as "gpt-5.6-luna", so its own word is the pattern; derived, not
+# curated, with a couple of vendor synonyms the slug alone would miss.
+_FREEBUFF_SYNONYM = {"luna": ("luna", "gpt-5.6"), "solar-pro4": ("solar",),
+                     "muse-spark": ("muse",), "fable": ("fable",),
+                     "minimax-m3": ("minimax",)}
+
+
+def _freebuff_parse_families(text):
+    """The distinct free-model families in free-agents.ts, as (slug, display).
+
+    A family is the token after `base2-free-`/`base3-free-`, with the
+    tier/variant suffixes stripped (-max, -es, -pro, -crof, -1-3), so
+    `base2-free-deepseek-flash-max` and `base2-free-deepseek-flash` are one."""
+    import re as _re
+    slugs = set(_re.findall(r"base[23]-free-([a-z0-9-]+)", text or ""))
+    fams = {}
+    for slug in slugs:
+        core = _re.sub(r"-(max|es|pro|crof|limited|contributor|\d+(-\d+)?)$", "", slug)
+        core = _re.sub(r"-(max|es|limited|contributor)$", "", core).strip("-")
+        if not core or core in fams:
+            continue
+        display = " ".join(w.upper() if w in ("glm", "gpt", "hy3") else w.title()
+                           for w in core.split("-"))
+        fams[core] = display
+    return sorted(fams.items())
+
+
+def _freebuff_families():
+    """The free families, from the repo, cached. Falls back to the seed."""
+    now = time.time()
+    with _freebuff_models_lock:
+        fam = _freebuff_models_cache["families"]
+        if fam is not None and now - _freebuff_models_cache["at"] < _FREEBUFF_MODELS_TTL:
+            return fam
+    fetched = None
+    try:
+        resp = requests.get(_FREEBUFF_AGENTS_URL, timeout=15,
+                            headers={"User-Agent": "free-llm-hub"})
+        if resp.status_code == 200:
+            parsed = _freebuff_parse_families(resp.text)
+            if parsed:
+                fetched = parsed
+    except Exception:                                            # noqa: BLE001
+        fetched = None
+    fam = fetched if fetched else list(_FREEBUFF_SEED_FAMILIES)
+    source = "repo" if fetched else "seed"
+    with _freebuff_models_lock:
+        _freebuff_models_cache.update({"at": now, "families": fam, "source": source})
+    return fam
+
+
+def _freebuff_patterns(slug):
+    """Substring patterns to spot a family in a hub model id: the slug, its
+    dot-spelled form (glm-5-3-flash -> glm-5.3-flash), and any synonym."""
+    import re as _re
+    pats = {slug, _re.sub(r"(\d)-(\d)", r"\1.\2", slug)}
+    pats.update(_FREEBUFF_SYNONYM.get(slug, ()))
+    return tuple(p for p in pats if p)
+
+
+def _freebuff_match(slug, mid):
+    """Does a hub model id belong to this free family? A hub id spells a model
+    many ways ('deepseek-ai/DeepSeek-V4.1-Flash' for the 'deepseek-flash'
+    family), so a whole-slug substring is too strict: it matches when the id
+    contains EVERY word of the slug, or any vendor synonym."""
+    mid = (mid or "").lower()
+    words = [w for w in slug.split("-") if w]
+    if words and all(w in mid for w in words):
+        return True
+    return any(syn in mid for syn in _FREEBUFF_SYNONYM.get(slug, ()))
+
+
+@app.route("/api/freebuff/models", methods=["GET"])
+def api_freebuff_models():
+    """Which of Freebuff's free models the hub can already route to -- the free
+    families read from Codebuff's own repo (see _freebuff_families), matched
+    against the hub's live catalog. So the user gets Freebuff's best free
+    models as ordinary routed models, with chain fallback and best-model pick,
+    without Freebuff's account or window. Never raises into a 500."""
+    try:
+        rows = (api_tracking().get_json() or {}).get("models") or []
+    except Exception:                                            # noqa: BLE001
+        rows = []
+    try:
+        fams = _freebuff_families()
+    except Exception:                                            # noqa: BLE001
+        fams = list(_FREEBUFF_SEED_FAMILIES)
+    live = []
+    for slug, display in fams:
+        hits = [r for r in rows if _freebuff_match(slug, str(r.get("model") or ""))]
+        ok = [h for h in hits if h.get("state") == "ok"]
+        live.append({
+            "name": display,
+            "available": bool(ok),
+            "known": len(hits),
+            "ok": len(ok),
+            "providers": sorted({h.get("provider") for h in ok})[:6],
+            "pick": (sorted(ok, key=lambda h: -(h.get("score") or 0))[0].get("id")
+                     if ok else None),
+        })
+    live.sort(key=lambda m: (0 if m["available"] else 1, m["name"]))
+    with _freebuff_models_lock:
+        source = _freebuff_models_cache.get("source", "seed")
+    return jsonify({"models": live, "source": source,
+                    "available": sum(1 for m in live if m["available"]),
+                    "total": len(live)})
+
+
 @app.route("/api/freebuff/install", methods=["POST"])
 def api_freebuff_install():
     """`npm install -g freebuff --prefix <isolated>` -- an admin click, a real
