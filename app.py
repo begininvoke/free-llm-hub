@@ -910,6 +910,8 @@ def _codex_catalog_label(mid):
     """What the picker's first screen shows. A label, never the bare id."""
     if mid == MODE_ALL:
         return "All free models (Calvoun hub)"
+    if mid == "max":
+        return "Max — strongest free models (Calvoun hub)"
     for key, label, _help in model_categories.labels():
         if key == mid:
             return "%s only (Calvoun hub)" % label
@@ -5776,7 +5778,7 @@ def _is_orchestrate(model):
     model = (model or "").strip().lower()
     if "/" in model:
         return False
-    return (not model) or model in ("auto", "orchestrate", "default", "best") \
+    return (not model) or model in ("auto", "orchestrate", "default", "all", "best", "max") \
         or model in _mode_keys() \
         or model.startswith("claude") \
         or model in _CLAUDE_MODEL_ALIASES
@@ -17875,22 +17877,41 @@ _SWARM_IDS = ("swarm", "team", "plan")
 # so every CLI's /model picker offered Normal and Swarm and silently dropped
 # Max. One list, used by all three, so the next mode cannot be forgotten in two
 # places out of three.
+# The words a CLI's /model picker shows for the hub's own ids. Grouped with a
+# leading kind ("Category ·", "Pipeline ·", the tier words) so a flat list
+# still reads as three groups. "all" and "max" are the plain-language aliases
+# the user asked for: "all" is auto with no category limit, "max" is "best".
 _VIRTUAL_MODEL_LABELS = {
-    "auto": "auto (orchestrated — best free model per task)",
-    "best": "best (Max — strongest free models only)",
+    "auto": "Auto · orchestrated (best free model per task)",
+    "all": "All models · every category, orchestrated",
+    "best": "Max · strongest free models only",
+    "max": "Max · strongest free models only",
+}
+
+
+# A friendlier word for the swarm/crew pipeline ids than the bare slug.
+_PIPELINE_LABELS = {
+    "swarm": "Swarm agents (several models answer, best wins)",
+    "team": "Team (a swarm variant)",
+    "plan": "Plan (a swarm variant)",
+    "crew": "Crew (a multi-role pipeline)",
+    "crew-code": "Crew · code", "crew-research": "Crew · research",
+    "crew-write": "Crew · write", "crew-design": "Crew · design",
 }
 
 
 def _virtual_model_label(mid):
-    """What a picker shows next to the id. The routing MODES say what they do;
-    everything else is a pipeline."""
+    """What a picker shows next to the id. Three groups: the tiers
+    (Auto/All/Max), the CATEGORIES (from model_categories -- dynamic, so a new
+    category shows up here on its own), and the PIPELINES (swarm/crew)."""
     if mid in _VIRTUAL_MODEL_LABELS:
         return _VIRTUAL_MODEL_LABELS[mid]
     if mid in _mode_keys():
         for key, label, _help in model_categories.labels():
             if key == mid:
-                return "%s (mode - %s only)" % (mid, label.lower())
-    return mid + " (multi-model pipeline)"
+                return "Category · %s" % label
+        return "Category · %s" % mid
+    return "Pipeline · " + _PIPELINE_LABELS.get(mid, mid)
 
 
 def _virtual_model_ids():
@@ -17900,7 +17921,11 @@ def _virtual_model_ids():
     # routes exactly like `auto` while restricting the pool to that category, so
     # "use the coding models here" is expressible from opencode, codex, Claude
     # Code and the rest without any per-CLI plumbing.
-    return ("auto", "best") + _mode_keys() + _SWARM_IDS + tuple(crews.CREW_IDS)
+    # auto / all / best / max are the tiers, then every category (dynamic
+    # from _mode_keys, no hardcoding), then the pipelines. "all" and "max"
+    # are aliases -- "all" == auto with no category limit, "max" == best --
+    # added because they are the words people reach for.
+    return ("auto", "all", "best", "max") + _mode_keys() + _SWARM_IDS + tuple(crews.CREW_IDS)
 
 # Total deadline for ONE swarm/crew stage hop. Swarm stages dispatch
 # non-streaming, so they get neither the streaming first-byte peek (~25-90s)
@@ -18833,7 +18858,7 @@ def _quality_route_kwargs(model, has_images):
     """quality_mode=True for the 'best' id, the same test /v1/chat/completions
     makes. Vision routing has its own model pool and no quality tier, so it is
     left alone there, matching the chat endpoint exactly."""
-    if not has_images and (model or "").strip().lower() == "best":
+    if not has_images and (model or "").strip().lower() in ("best", "max"):
         return {"quality_mode": True}
     return {}
 
@@ -19698,7 +19723,7 @@ def _chat_completions_uncached(body):
     if not _pin_kw:
         router = _route_for_vision if has_images else _route_by_difficulty
         _rkw = {}
-        if (body.get("model") or "").strip().lower() == "best" and not has_images:
+        if (body.get("model") or "").strip().lower() in ("best", "max") and not has_images:
             _rkw["quality_mode"] = True
         # A MODE id ("coding", "vision", ...) routes exactly like `auto` and
         # restricts the pool to that category for THIS request only -- the one

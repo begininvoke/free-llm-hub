@@ -152,11 +152,13 @@ def test_a_real_model_id_is_still_not_orchestrated():
     assert not A._is_orchestrate("groq/qwen3-coder")
 
 
-def test_a_mode_is_labelled_as_a_mode_not_a_pipeline():
-    """The pickers show this string; calling a mode a "multi-model pipeline"
-    would describe the swarm, which is a different feature."""
-    assert "mode" in A._virtual_model_label("coding")
-    assert "pipeline" in A._virtual_model_label("crew")
+def test_a_mode_is_labelled_as_a_category_not_a_pipeline():
+    """The pickers show this string, grouped by kind: a category reads
+    "Category · ...", a swarm/crew reads "Pipeline · ...". Calling a category a
+    pipeline would describe the swarm, which is a different feature."""
+    coding = A._virtual_model_label("coding")
+    assert coding.startswith("Category ·") and "Pipeline" not in coding
+    assert A._virtual_model_label("crew").startswith("Pipeline ·")
 
 
 # --------------------------------------------------------------------------- #
